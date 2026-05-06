@@ -1,0 +1,52 @@
+STZMP_DISTILLATION_CFG = {
+    "runner": {
+        "class_name": "DistillationRunner",
+        "num_steps_per_env": 24,
+        "save_interval": 100,
+        "max_iterations": 30000,
+    },
+
+    # obs_groups maps RSL-RL set names → Isaac Lab group names
+    "obs_groups": {
+        "policy":   ["policy"],           # flat tensor from Isaac Lab "policy" group
+        "teacher":  ["teacher_obs"],      # flat tensor from Isaac Lab "teacher_obs" group
+        "zmp_star": ["delta_zmp_star"],   # 2D privileged group (new)
+    },
+
+    "algorithm": {
+        "class_name":          "STZMPDistillation",
+        "num_learning_epochs": 1,
+        "gradient_length":     15,
+        "learning_rate":       1e-3,
+        "max_grad_norm":       1.0,
+        "w_bc":                1.0,
+        "w_nll":               1.0,
+        "delta_zmp_obs_key":   "zmp_star",
+    },
+
+    "policy": {
+        "class_name":          "STZMPStudentTeacher",
+        # Joint / history layout
+        "history_len":         10,
+        "num_joints":          12,
+        "num_legs":            4,
+        "leg_joint_indices":   [[0,1,2], [3,4,5], [6,7,8], [9,10,11]],
+        "history_order":       "oldest_first",
+        # Sizes of each term in obs["policy"] — must match Isaac Lab term dims
+        "base_lin_vel_dim":       3,
+        "base_ang_vel_dim":       3,
+        "projected_gravity_dim":  3,
+        "command_dim":            5,
+        # height_scan_dim is inferred from the remainder automatically
+        # Encoder
+        "d_model":             32,
+        "num_heads":           4,
+        "temporal_mlp_width":  64,
+        "activation":          "elu",
+        # MLPs
+        "actor_hidden_dims":   [512, 256, 128],
+        "teacher_hidden_dims": [512, 256, 128],
+        "teacher_obs_normalization": True,
+        "init_noise_std":      0.1,
+    },
+}

@@ -10,12 +10,15 @@ from .actor_critic_recurrent import ActorCriticRecurrent
 from .rnd import RandomNetworkDistillation, resolve_rnd_config
 from .student_teacher import StudentTeacher
 from .student_teacher_recurrent import StudentTeacherRecurrent
+from .stzmp_student_teacher import STZMPEncoder, STZMPStudentTeacher
 from .symmetry import resolve_symmetry_config
 
 __all__ = [
     "ActorCritic",
     "ActorCriticRecurrent",
     "RandomNetworkDistillation",
+    "STZMPEncoder",
+    "STZMPStudentTeacher",
     "StudentTeacher",
     "StudentTeacherRecurrent",
     "resolve_rnd_config",
