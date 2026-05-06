@@ -524,6 +524,25 @@ class STZMPStudentTeacher(nn.Module):
         base_current = self._build_base_token(parsed)
         return self.encoder(leg_tokens, base_current, deterministic=deterministic)
 
+    # ── Distribution properties (required by OnPolicyRunner.log) ─────────────
+
+    @property
+    def action_mean(self) -> torch.Tensor:
+        assert self.distribution is not None
+        return self.distribution.mean
+
+    @property
+    def action_std(self) -> torch.Tensor:
+        """Return current action std. Falls back to the std parameter before the first act() call."""
+        if self.distribution is not None:
+            return self.distribution.stddev
+        return self.std
+
+    @property
+    def entropy(self) -> torch.Tensor:
+        assert self.distribution is not None
+        return self.distribution.entropy().sum(dim=-1)
+
     # ── Public forward methods ───────────────────────────────────────────────
 
     def act(self, obs: TensorDict) -> torch.Tensor:
