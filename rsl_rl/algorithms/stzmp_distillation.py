@@ -70,6 +70,11 @@ class STZMPDistillation(Distillation):
         w_bc: float = 1.0,
         w_nll: float = 1.0,
         delta_zmp_obs_key: str = "zmp_star",
+        # Logging-only parameter — does NOT affect the loss or gradients.
+        # Steps where ||delta_zmp_star||₂ >= this value are counted as "under load"
+        # for the sigma² diagnostic logs (sigma2_free / sigma2_load / sigma2_ratio).
+        # Tune to match the minimum ZMP shift your force curriculum produces (~2 cm).
+        log_sigma2_load_threshold: float = 0.02,
         # Inherited Distillation params
         num_learning_epochs: int = 1,
         gradient_length: int = 15,
@@ -94,10 +99,12 @@ class STZMPDistillation(Distillation):
         self.w_bc = w_bc
         self.w_nll = w_nll
         self.delta_zmp_obs_key = delta_zmp_obs_key
+        self.log_sigma2_load_threshold = log_sigma2_load_threshold
 
         print(
             f"[STZMPDistillation] w_bc={w_bc}  w_nll={w_nll}  "
-            f"delta_zmp_obs_key='{delta_zmp_obs_key}'"
+            f"delta_zmp_obs_key='{delta_zmp_obs_key}'  "
+            f"log_sigma2_load_threshold={log_sigma2_load_threshold} m (logging only)"
         )
 
     # ── Loss helpers ─────────────────────────────────────────────────────────
@@ -148,6 +155,14 @@ class STZMPDistillation(Distillation):
         loss            = torch.tensor(0.0, device=self.device)
         cnt             = 0
 
+        # ── Logging-only accumulators (no gradient impact) ───────────────────
+        log_sigma2_sum       = 0.0   # sum of per-step mean sigma²
+        log_sigma2_free_sum  = 0.0   # sum of mean sigma² on free-space steps
+        log_sigma2_load_sum  = 0.0   # sum of mean sigma² on under-load steps
+        log_zmp_err_load_sum = 0.0   # sum of mean ZMP prediction error under load
+        log_cnt_free         = 0     # steps that had any free-space envs
+        log_cnt_load         = 0     # steps that had any under-load envs
+
         for _ in range(self.num_learning_epochs):
             self.policy.reset(hidden_states=self.last_hidden_states)
             self.policy.detach_hidden_states()
@@ -181,6 +196,30 @@ class STZMPDistillation(Distillation):
                 mean_total_loss += step_loss.item()
                 cnt             += 1
 
+                # ── Sigma² diagnostics (logging only, no gradients) ──────────
+                # All ops run inside no_grad; .item() ensures no graph is retained.
+                with torch.no_grad():
+                    # sigma² per env: mean over the 2 ZMP dimensions → [B]
+                    sigma2 = logvar_zmp.exp().mean(dim=-1)          # [B]
+                    log_sigma2_sum += sigma2.mean().item()
+
+                    # Split envs by whether their ZMP target indicates force contact.
+                    # This is a logging heuristic only — threshold has no effect on training.
+                    zmp_mag = delta_zmp_star.norm(dim=-1)            # [B]
+                    load_mask = zmp_mag >= self.log_sigma2_load_threshold
+                    free_mask = ~load_mask
+
+                    if load_mask.any():
+                        log_sigma2_load_sum  += sigma2[load_mask].mean().item()
+                        log_zmp_err_load_sum += (
+                            (mu_zmp - delta_zmp_star)[load_mask].norm(dim=-1).mean().item()
+                        )
+                        log_cnt_load += 1
+
+                    if free_mask.any():
+                        log_sigma2_free_sum += sigma2[free_mask].mean().item()
+                        log_cnt_free += 1
+
                 # ── Gradient step every gradient_length steps ────────────────
                 if cnt % self.gradient_length == 0:
                     self.optimizer.zero_grad()
@@ -204,12 +243,27 @@ class STZMPDistillation(Distillation):
         mean_nll_loss   /= cnt
         mean_total_loss /= cnt
 
+        # Normalise sigma² diagnostics; guard against zero counts
+        sigma2_mean = log_sigma2_sum / cnt
+        sigma2_free = log_sigma2_free_sum / log_cnt_free  if log_cnt_free  > 0 else float("nan")
+        sigma2_load = log_sigma2_load_sum / log_cnt_load  if log_cnt_load  > 0 else float("nan")
+        zmp_err_load = log_zmp_err_load_sum / log_cnt_load if log_cnt_load > 0 else float("nan")
+        # Ratio > 1 means encoder is more uncertain in free space than under load (desired).
+        sigma2_ratio = (sigma2_free / sigma2_load) if (log_cnt_load > 0 and log_cnt_free > 0) else float("nan")
+
         self.storage.clear()
         self.last_hidden_states = self.policy.get_hidden_states()
         self.policy.detach_hidden_states()
 
         return {
-            "behavior": mean_bc_loss,
-            "nll":      mean_nll_loss,
-            "total":    mean_total_loss,
+            # ── Training losses ───────────────────────────────────────────────
+            "behavior":     mean_bc_loss,
+            "nll":          mean_nll_loss,
+            "total":        mean_total_loss,
+            # ── Sigma² diagnostics (logging only) ────────────────────────────
+            "sigma2_mean":  sigma2_mean,   # overall mean σ²
+            "sigma2_free":  sigma2_free,   # σ² in free space  (target: > 0.3)
+            "sigma2_load":  sigma2_load,   # σ² under load     (target: < 0.05)
+            "sigma2_ratio": sigma2_ratio,  # free/load ratio   (target: > 5)
+            "zmp_err_load": zmp_err_load,  # |mu - target| under load (target: < 0.02 m)
         }

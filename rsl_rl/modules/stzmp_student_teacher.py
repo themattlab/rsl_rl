@@ -134,16 +134,23 @@ class STZMPEncoder(nn.Module):
         leg_tokens: torch.Tensor,
         base_current: torch.Tensor,
         deterministic: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_attn_weights: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Run the encoder forward pass.
 
         Args:
             leg_tokens: Shape ``[B, num_legs, leg_token_dim]``.
             base_current: Shape ``[B, base_dim]``.
             deterministic: If ``True``, return ``mu_zmp`` as the sample (no noise).
+            return_attn_weights: If ``True``, compute and return the cross-attention
+                weight matrix (shape ``[B, num_heads, 1, num_legs]`` averaged to
+                ``[B, 1, num_legs]``). Adds a small overhead; leave ``False`` during
+                training and set to ``True`` only for logging / paper figures.
 
         Returns:
-            Tuple ``(mu_zmp, logvar_zmp, z_sample)``, each ``[B, 2]``.
+            Tuple ``(mu_zmp, logvar_zmp, z_sample, attn_weights)``, each ``[B, 2]``
+            for the first three.  ``attn_weights`` is ``[B, 1, num_legs]`` when
+            ``return_attn_weights=True``, else ``None``.
         """
         B = leg_tokens.shape[0]
 
@@ -159,12 +166,15 @@ class STZMPEncoder(nn.Module):
         # Step 3: project base state to d_model
         e_base = self.base_proj_mlp(base_current).unsqueeze(1)         # [B, 1, d_model]
 
-        # Step 4: cross-attention — base (query) attends to legs (key, value)
-        # Attention weights [B, 1, L] show which leg is attended to (interpretability figure)
-        z_latent, _ = self.cross_attn(
-            query=e_base,   # [B, 1, d_model]
-            key=e_legs,     # [B, L, d_model]
-            value=e_legs,   # [B, L, d_model]
+        # Step 4: cross-attention — base (query) attends to legs (key, value).
+        # need_weights=True is required to get the attention matrix; it is disabled
+        # during normal training for speed (average_attn_weights collapses heads → [B,1,L]).
+        z_latent, attn_weights = self.cross_attn(
+            query=e_base,                                # [B, 1, d_model]
+            key=e_legs,                                  # [B, L, d_model]
+            value=e_legs,                                # [B, L, d_model]
+            need_weights=return_attn_weights,            # False → faster; True → returns [B, 1, L]
+            average_attn_weights=True,                   # average over heads → [B, 1, L]
         )
         z_latent = z_latent.squeeze(1)                                  # [B, d_model]
 
@@ -180,7 +190,7 @@ class STZMPEncoder(nn.Module):
             std = torch.exp(0.5 * logvar_zmp)
             z_sample = mu_zmp + std * torch.randn_like(std)             # [B, 2]
 
-        return mu_zmp, logvar_zmp, z_sample
+        return mu_zmp, logvar_zmp, z_sample, attn_weights
 
 
 # ---------------------------------------------------------------------------
@@ -518,11 +528,16 @@ class STZMPStudentTeacher(nn.Module):
         self,
         policy_obs: torch.Tensor,
         deterministic: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_attn_weights: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         parsed       = self._parse_policy_obs(policy_obs)
         leg_tokens   = self._build_leg_tokens(parsed)
         base_current = self._build_base_token(parsed)
-        return self.encoder(leg_tokens, base_current, deterministic=deterministic)
+        return self.encoder(
+            leg_tokens, base_current,
+            deterministic=deterministic,
+            return_attn_weights=return_attn_weights,
+        )
 
     # ── Distribution properties (required by OnPolicyRunner.log) ─────────────
 
@@ -555,7 +570,7 @@ class STZMPStudentTeacher(nn.Module):
         parsed       = self._parse_policy_obs(policy_obs)
         leg_tokens   = self._build_leg_tokens(parsed)
         base_current = self._build_base_token(parsed)
-        mu_zmp, logvar_zmp, z_sample = self.encoder(
+        mu_zmp, logvar_zmp, z_sample, _ = self.encoder(
             leg_tokens, base_current, deterministic=False
         )
         actor_input = self._build_actor_input(parsed, z_sample, logvar_zmp)
@@ -575,7 +590,7 @@ class STZMPStudentTeacher(nn.Module):
         parsed       = self._parse_policy_obs(policy_obs)
         leg_tokens   = self._build_leg_tokens(parsed)
         base_current = self._build_base_token(parsed)
-        mu_zmp, logvar_zmp, _ = self.encoder(
+        mu_zmp, logvar_zmp, _, _attn = self.encoder(
             leg_tokens, base_current, deterministic=True
         )
         actor_input = self._build_actor_input(parsed, mu_zmp, logvar_zmp)
@@ -597,7 +612,7 @@ class STZMPStudentTeacher(nn.Module):
         parsed       = self._parse_policy_obs(policy_obs)
         leg_tokens   = self._build_leg_tokens(parsed)
         base_current = self._build_base_token(parsed)
-        mu_zmp, logvar_zmp, z_sample = self.encoder(
+        mu_zmp, logvar_zmp, z_sample, _ = self.encoder(
             leg_tokens, base_current, deterministic=False
         )
         actor_input = self._build_actor_input(parsed, z_sample, logvar_zmp)
@@ -615,7 +630,7 @@ class STZMPStudentTeacher(nn.Module):
         parsed       = self._parse_policy_obs(policy_obs)
         leg_tokens   = self._build_leg_tokens(parsed)
         base_current = self._build_base_token(parsed)
-        mu_zmp, logvar_zmp, _ = self.encoder(
+        mu_zmp, logvar_zmp, _, _attn = self.encoder(
             leg_tokens, base_current, deterministic=True
         )
         confidence = torch.exp(-logvar_zmp)
@@ -623,6 +638,37 @@ class STZMPStudentTeacher(nn.Module):
         z_deploy = confidence * mu_zmp
         actor_input = self._build_actor_input(parsed, z_deploy, logvar_zmp)
         return self.student_actor(actor_input)
+
+    def encode_with_attn(
+        self, obs: TensorDict
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the encoder and return the ZMP latent **plus** attention weights.
+
+        Intended for logging, paper figures, and on-robot debugging — not for
+        training (``need_weights=True`` has a small overhead).
+
+        Returns:
+            ``(mu_zmp, logvar_zmp, attn_weights)``
+
+            * ``mu_zmp``       — ``[B, 2]`` mean ZMP shift prediction.
+            * ``logvar_zmp``   — ``[B, 2]`` log-variance.
+            * ``attn_weights`` — ``[B, 1, num_legs]`` cross-attention scores
+              averaged over heads. Entry ``[b, 0, l]`` is the attention weight
+              the base token places on leg ``l`` for sample ``b``.
+              Useful for: identifying which legs drive bracing, making paper
+              figures, or streaming to a debug display on hardware.
+        """
+        policy_obs   = self._get_policy_obs(obs)
+        parsed       = self._parse_policy_obs(policy_obs)
+        leg_tokens   = self._build_leg_tokens(parsed)
+        base_current = self._build_base_token(parsed)
+        mu_zmp, logvar_zmp, _, attn_weights = self.encoder(
+            leg_tokens, base_current,
+            deterministic=True,
+            return_attn_weights=True,
+        )
+        assert attn_weights is not None   # guaranteed by return_attn_weights=True
+        return mu_zmp, logvar_zmp, attn_weights
 
     def evaluate(self, obs: TensorDict) -> torch.Tensor:
         """Run the frozen teacher MLP and return its deterministic action.
@@ -681,7 +727,11 @@ class STZMPStudentTeacher(nn.Module):
             ``True`` if training resumes (distillation checkpoint),
             ``False`` for a fresh distillation run (RL checkpoint).
         """
-        if any("actor." in key for key in state_dict):
+        _is_rl_ckpt = any(
+            key.startswith("actor.") or key.startswith("actor_obs_normalizer.")
+            for key in state_dict
+        )
+        if _is_rl_ckpt:
             teacher_sd: dict = {}
             teacher_norm_sd: dict = {}
             for key, value in state_dict.items():
