@@ -70,10 +70,15 @@ class STZMPDistillation(Distillation):
         w_bc: float = 1.0,
         w_nll: float = 1.0,
         delta_zmp_obs_key: str = "zmp_star",
+        # Scales delta_zmp_star before NLL loss so that targets in the 0.01-0.1 m
+        # range become 0.1-1.0, giving the loss a stronger gradient signal.
+        # The encoder learns to predict in these scaled units; divide outputs by
+        # this factor to recover metres.  Has no effect on BC loss or rollouts.
+        zmp_target_scale: float = 10.0,
         # Logging-only parameter — does NOT affect the loss or gradients.
         # Steps where ||delta_zmp_star||₂ >= this value are counted as "under load"
         # for the sigma² diagnostic logs (sigma2_free / sigma2_load / sigma2_ratio).
-        # Tune to match the minimum ZMP shift your force curriculum produces (~2 cm).
+        # Always in unscaled metres — independent of zmp_target_scale.
         log_sigma2_load_threshold: float = 0.02,
         # Inherited Distillation params
         num_learning_epochs: int = 1,
@@ -99,11 +104,13 @@ class STZMPDistillation(Distillation):
         self.w_bc = w_bc
         self.w_nll = w_nll
         self.delta_zmp_obs_key = delta_zmp_obs_key
+        self.zmp_target_scale = zmp_target_scale
         self.log_sigma2_load_threshold = log_sigma2_load_threshold
 
         print(
             f"[STZMPDistillation] w_bc={w_bc}  w_nll={w_nll}  "
             f"delta_zmp_obs_key='{delta_zmp_obs_key}'  "
+            f"zmp_target_scale={zmp_target_scale}  "
             f"log_sigma2_load_threshold={log_sigma2_load_threshold} m (logging only)"
         )
 
@@ -156,12 +163,14 @@ class STZMPDistillation(Distillation):
         cnt             = 0
 
         # ── Logging-only accumulators (no gradient impact) ───────────────────
-        log_sigma2_sum       = 0.0   # sum of per-step mean sigma²
-        log_sigma2_free_sum  = 0.0   # sum of mean sigma² on free-space steps
-        log_sigma2_load_sum  = 0.0   # sum of mean sigma² on under-load steps
-        log_zmp_err_load_sum = 0.0   # sum of mean ZMP prediction error under load
-        log_cnt_free         = 0     # steps that had any free-space envs
-        log_cnt_load         = 0     # steps that had any under-load envs
+        log_sigma2_sum          = 0.0   # sum of per-step mean sigma²
+        log_sigma2_free_sum     = 0.0   # sum of mean sigma² on free-space steps
+        log_sigma2_load_sum     = 0.0   # sum of mean sigma² on under-load steps
+        log_zmp_err_load_sum    = 0.0   # sum of mean ZMP prediction error under load
+        log_logvar_sum          = 0.0   # sum of mean raw logvar (catch clamp saturation)
+        log_logvar_clamp_sum    = 0.0   # sum of fraction of values touching either clamp bound
+        log_cnt_free            = 0     # steps that had any free-space envs
+        log_cnt_load            = 0     # steps that had any under-load envs
 
         for _ in range(self.num_learning_epochs):
             self.policy.reset(hidden_states=self.last_hidden_states)
@@ -184,8 +193,11 @@ class STZMPDistillation(Distillation):
                         f"  Add a '{self.delta_zmp_obs_key}' obs group to your Isaac Lab task "
                         f"and include it in obs_groups in the training config."
                     )
-                delta_zmp_star = obs[self.delta_zmp_obs_key]                 # [B, 2]
-                nll_loss = self._gaussian_nll(mu_zmp, logvar_zmp, delta_zmp_star)
+                delta_zmp_star = obs[self.delta_zmp_obs_key]                 # [B, 2], metres
+                # Scale targets so 0.01-0.1 m → 0.1-1.0, giving stronger NLL gradients.
+                # The encoder learns to predict in these scaled units.
+                delta_zmp_scaled = delta_zmp_star * self.zmp_target_scale    # [B, 2]
+                nll_loss = self._gaussian_nll(mu_zmp, logvar_zmp, delta_zmp_scaled)
 
                 # ── Weighted total ───────────────────────────────────────────
                 step_loss = self.w_bc * bc_loss + self.w_nll * nll_loss
@@ -203,16 +215,25 @@ class STZMPDistillation(Distillation):
                     sigma2 = logvar_zmp.exp().mean(dim=-1)          # [B]
                     log_sigma2_sum += sigma2.mean().item()
 
-                    # Split envs by whether their ZMP target indicates force contact.
-                    # This is a logging heuristic only — threshold has no effect on training.
-                    zmp_mag = delta_zmp_star.norm(dim=-1)            # [B]
+                    # Raw logvar diagnostics — detect clamp saturation.
+                    # Clamp bounds: [-10, 2].  If logvar_mean drifts near ±10/2
+                    # or clamp_frac > 0.05, the encoder variance head needs attention.
+                    log_logvar_sum       += logvar_zmp.mean().item()
+                    clamp_hit = (logvar_zmp <= -9.9) | (logvar_zmp >= 1.9)
+                    log_logvar_clamp_sum += clamp_hit.float().mean().item()
+
+                    # Load detection uses unscaled metres so the threshold stays
+                    # in interpretable physical units regardless of zmp_target_scale.
+                    zmp_mag = delta_zmp_star.norm(dim=-1)            # [B], metres
                     load_mask = zmp_mag >= self.log_sigma2_load_threshold
                     free_mask = ~load_mask
 
                     if load_mask.any():
                         log_sigma2_load_sum  += sigma2[load_mask].mean().item()
+                        # mu_zmp is in scaled units; divide back to metres for logging.
                         log_zmp_err_load_sum += (
-                            (mu_zmp - delta_zmp_star)[load_mask].norm(dim=-1).mean().item()
+                            (mu_zmp / self.zmp_target_scale - delta_zmp_star)[load_mask]
+                            .norm(dim=-1).mean().item()
                         )
                         log_cnt_load += 1
 
@@ -251,19 +272,26 @@ class STZMPDistillation(Distillation):
         # Ratio > 1 means encoder is more uncertain in free space than under load (desired).
         sigma2_ratio = (sigma2_free / sigma2_load) if (log_cnt_load > 0 and log_cnt_free > 0) else float("nan")
 
+        # Logvar diagnostics
+        logvar_mean       = log_logvar_sum       / cnt   # healthy range: ~[-4, 0]
+        logvar_clamp_frac = log_logvar_clamp_sum / cnt   # alert if > 0.05
+
         self.storage.clear()
         self.last_hidden_states = self.policy.get_hidden_states()
         self.policy.detach_hidden_states()
 
         return {
             # ── Training losses ───────────────────────────────────────────────
-            "behavior":     mean_bc_loss,
-            "nll":          mean_nll_loss,
-            "total":        mean_total_loss,
+            "behavior":          mean_bc_loss,
+            "nll":               mean_nll_loss,
+            "total":             mean_total_loss,
             # ── Sigma² diagnostics (logging only) ────────────────────────────
-            "sigma2_mean":  sigma2_mean,   # overall mean σ²
-            "sigma2_free":  sigma2_free,   # σ² in free space  (target: > 0.3)
-            "sigma2_load":  sigma2_load,   # σ² under load     (target: < 0.05)
-            "sigma2_ratio": sigma2_ratio,  # free/load ratio   (target: > 5)
-            "zmp_err_load": zmp_err_load,  # |mu - target| under load (target: < 0.02 m)
+            "sigma2_mean":       sigma2_mean,       # overall mean σ²
+            "sigma2_free":       sigma2_free,       # σ² in free space  (target: > 0.3)
+            "sigma2_load":       sigma2_load,       # σ² under load     (target: < 0.05)
+            "sigma2_ratio":      sigma2_ratio,      # free/load ratio   (target: > 5)
+            "zmp_err_load":      zmp_err_load,      # |mu - target| under load (target: < 0.02 m)
+            # ── Logvar clamp diagnostics (logging only) ───────────────────────
+            "logvar_mean":       logvar_mean,       # healthy range: ~ -4 to 0
+            "logvar_clamp_frac": logvar_clamp_frac, # alert if > 0.05 (5 % values hitting clamp)
         }
