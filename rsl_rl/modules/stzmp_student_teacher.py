@@ -406,6 +406,12 @@ class STZMPStudentTeacher(nn.Module):
         if teacher_hidden_dims is None:
             teacher_hidden_dims = [512, 256, 128]
 
+        # ── Encoder ──────────────────────────────────────────────────────────
+        # Each leg token: [q_hist | dq_hist | action_hist] for joints_per_leg joints
+        leg_token_dim = history_len * joints_per_leg * 3
+        # Task-conditioned base token: gravity(3) + ang_vel(3) + lin_vel(3) + command(5) = 14D
+        base_enc_dim = projected_gravity_dim + base_ang_vel_dim + base_lin_vel_dim + command_dim
+
         # Print layout for the user to verify
         _print_obs_layout(
             actual_policy_dim,
@@ -416,12 +422,6 @@ class STZMPStudentTeacher(nn.Module):
             leg_names=leg_names,
             leg_joint_indices=leg_joint_indices,
         )
-
-        # ── Encoder ──────────────────────────────────────────────────────────
-        # Each leg token: [q_hist | dq_hist | action_hist] for joints_per_leg joints
-        leg_token_dim = history_len * joints_per_leg * 3
-        # Task-conditioned base token: gravity(3) + ang_vel(3) + lin_vel(3) + command(5) = 14D
-        base_enc_dim = projected_gravity_dim + base_ang_vel_dim + base_lin_vel_dim + command_dim
 
         self.encoder = STZMPEncoder(
             num_legs=num_legs,
