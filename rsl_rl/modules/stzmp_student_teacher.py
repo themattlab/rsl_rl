@@ -31,9 +31,19 @@ Encoder
 -------
 1. Shared temporal MLP compresses each leg's [q | dq | action] history to d_model.
 2. Learned positional embeddings distinguish the four legs.
-3. Base projection MLP embeds current [projected_gravity | base_ang_vel].
+3. Base projection MLP embeds task-conditioned base token:
+   [projected_gravity | base_ang_vel | base_lin_vel | command].
+   Including lin_vel and command makes the query task-conditioned — the encoder
+   learns to attend to the correct manipulator leg given the active command.
 4. Cross-attention: base token (query) attends to four leg tokens (key/value).
 5. mu_head + logvar_head produce the 2-D Gaussian ZMP latent.
+
+Actor
+-----
+Receives: joint_pos_cur, joint_vel_cur, actions_recent (last actor_action_history_steps
+steps), all base terms, command, height_scan, z_sample, logvar_zmp.
+The encoder always sees the full history_len action steps inside each leg token;
+the actor sees only a short recent window (default 3) for smoothness.
 
 References
 ----------
@@ -66,8 +76,10 @@ class STZMPEncoder(nn.Module):
         num_legs: Number of legs (default 4).
         leg_token_dim: Flattened input size for each leg token.
             Equals ``history_len × joints_per_leg × 3`` (q + dq + action).
-        base_dim: Dimension of the base state token input (default 6:
-            projected_gravity(3) + base_ang_vel(3)).
+        base_dim: Dimension of the task-conditioned base token input (default 14:
+            projected_gravity(3) + base_ang_vel(3) + base_lin_vel(3) + command(5)).
+            Including lin_vel and command makes the cross-attention query
+            task-conditioned so the encoder attends to the correct leg.
         d_model: Attention embedding dimension (default 32).
         num_heads: Number of attention heads; must divide ``d_model`` (default 4).
         temporal_mlp_width: Hidden width of the shared temporal MLP (default 64).
@@ -78,7 +90,7 @@ class STZMPEncoder(nn.Module):
         self,
         num_legs: int = 4,
         leg_token_dim: int = 90,
-        base_dim: int = 6,
+        base_dim: int = 14,
         d_model: int = 32,
         num_heads: int = 4,
         temporal_mlp_width: int = 64,
@@ -270,6 +282,10 @@ class STZMPStudentTeacher(nn.Module):
         # MLP hidden layer widths
         actor_hidden_dims: list[int] | None = None,    # default: [512, 256, 128]
         teacher_hidden_dims: list[int] | None = None,  # default: [512, 256, 128]
+        # Action history depth for the actor (encoder always sees full history_len)
+        actor_action_history_steps: int = 3,
+        # Human-readable leg names in the same order as leg_joint_indices
+        leg_names: list[str] | None = None,
         # Misc
         teacher_obs_normalization: bool = False,
         init_noise_std: float = 0.1,
@@ -305,6 +321,16 @@ class STZMPStudentTeacher(nn.Module):
         self._num_leg_index_sets = num_legs
         joints_per_leg = len(leg_joint_indices[0])
 
+        # ── Leg names (for debug outputs and metadata) ───────────────────────
+        if leg_names is None:
+            leg_names = [f"leg_{i}" for i in range(num_legs)]
+        if len(leg_names) != num_legs:
+            raise ValueError(
+                f"[STZMPStudentTeacher] leg_names has {len(leg_names)} entries "
+                f"but num_legs={num_legs}."
+            )
+        self.leg_names: list[str] = list(leg_names)
+
         # ── History ordering ─────────────────────────────────────────────────
         if history_order not in ("oldest_first", "newest_first"):
             raise ValueError(
@@ -316,6 +342,24 @@ class STZMPStudentTeacher(nn.Module):
         self.num_legs = num_legs
         # Index of the most-recent timestep after reshape to [B, H, num_joints]
         self.newest_step_idx: int = history_len - 1 if history_order == "oldest_first" else 0
+
+        # ── Actor action history window ───────────────────────────────────────
+        # The encoder leg tokens carry the full history_len action steps.
+        # The actor receives only the last actor_action_history_steps actions
+        # (oldest-to-newest in the flattened output) for short-range smoothness.
+        if actor_action_history_steps < 1 or actor_action_history_steps > history_len:
+            raise ValueError(
+                f"[STZMPStudentTeacher] actor_action_history_steps must be in "
+                f"[1, history_len={history_len}], got {actor_action_history_steps}."
+            )
+        self.actor_action_history_steps: int = actor_action_history_steps
+        # Slice indices into the [B, H, N] action_hist tensor (always oldest-first slice)
+        if history_order == "oldest_first":
+            self._actor_act_start: int = history_len - actor_action_history_steps
+            self._actor_act_end: int   = history_len
+        else:  # newest_first: index 0 is most recent, so take first k steps
+            self._actor_act_start = 0
+            self._actor_act_end   = actor_action_history_steps
 
         # ── Policy obs dimension accounting ──────────────────────────────────
         actual_policy_dim: int = sum(
@@ -367,13 +411,17 @@ class STZMPStudentTeacher(nn.Module):
             actual_policy_dim,
             base_lin_vel_dim, base_ang_vel_dim, projected_gravity_dim, command_dim,
             history_len, num_joints, height_scan_dim, history_order,
+            actor_action_history_steps=actor_action_history_steps,
+            base_enc_dim=base_enc_dim,
+            leg_names=leg_names,
+            leg_joint_indices=leg_joint_indices,
         )
 
         # ── Encoder ──────────────────────────────────────────────────────────
         # Each leg token: [q_hist | dq_hist | action_hist] for joints_per_leg joints
         leg_token_dim = history_len * joints_per_leg * 3
-        # Encoder base token: projected_gravity(3) + base_ang_vel(3) = 6D
-        base_enc_dim = projected_gravity_dim + base_ang_vel_dim
+        # Task-conditioned base token: gravity(3) + ang_vel(3) + lin_vel(3) + command(5) = 14D
+        base_enc_dim = projected_gravity_dim + base_ang_vel_dim + base_lin_vel_dim + command_dim
 
         self.encoder = STZMPEncoder(
             num_legs=num_legs,
@@ -386,22 +434,26 @@ class STZMPStudentTeacher(nn.Module):
         )
 
         # ── Student actor MLP ────────────────────────────────────────────────
-        # Receives: current joint state (num_joints×3) + all non-history base terms
-        #           + command + height_scan + z_sample(2) + logvar_zmp(2)
+        # Receives: joint_pos_cur(N) + joint_vel_cur(N) + actions_recent(K*N)
+        #           + all base terms + command + height_scan + z_sample(2) + logvar_zmp(2)
+        # K = actor_action_history_steps (encoder sees full H steps; actor sees short K window)
         actor_input_dim = (
-            num_joints * 3           # joint_pos_cur + joint_vel_cur + actions_cur
-            + base_lin_vel_dim       # base_lin_vel (current)
-            + base_ang_vel_dim       # base_ang_vel (current)
-            + projected_gravity_dim  # projected_gravity (current)
-            + command_dim            # foot_position_commands
-            + height_scan_dim        # height_scan
-            + 2                      # z_sample (ZMP latent)
-            + 2                      # logvar_zmp (actor can gate on uncertainty)
+            num_joints                                      # joint_pos_cur
+            + num_joints                                    # joint_vel_cur
+            + num_joints * actor_action_history_steps       # actions_recent (K steps)
+            + base_lin_vel_dim                              # base_lin_vel
+            + base_ang_vel_dim                              # base_ang_vel
+            + projected_gravity_dim                         # projected_gravity
+            + command_dim                                   # foot_position_commands
+            + height_scan_dim                               # height_scan
+            + 2                                             # z_sample (ZMP latent)
+            + 2                                             # logvar_zmp (uncertainty gate)
         )
         self.student_actor = MLP(actor_input_dim, num_actions, actor_hidden_dims, activation)
         print(
             f"[STZMPStudentTeacher] Student actor: input={actor_input_dim}D  "
-            f"hidden={list(actor_hidden_dims)}  output={num_actions}D"
+            f"hidden={list(actor_hidden_dims)}  output={num_actions}D  "
+            f"(actor_action_history_steps={actor_action_history_steps})"
         )
 
         # Scalar action noise std (same convention as StudentTeacher)
@@ -448,7 +500,10 @@ class STZMPStudentTeacher(nn.Module):
           ``joint_vel_hist`` ``[B, H, num_joints]``,
           ``action_hist``    ``[B, H, num_joints]``,
           ``height_scan``,
-          ``joint_pos_cur``, ``joint_vel_cur``, ``actions_cur`` — current step only.
+          ``joint_pos_cur``, ``joint_vel_cur`` — most-recent step only,
+          ``actions_recent`` ``[B, actor_action_history_steps * num_joints]`` —
+              last ``actor_action_history_steps`` actions flattened oldest-first.
+              The encoder leg tokens always carry the full H-step action history.
         """
         B = policy_obs.shape[0]
         H, N = self.history_len, self.num_joints
@@ -461,6 +516,10 @@ class STZMPStudentTeacher(nn.Module):
         action_hist    = _s(self._sl_action_hist).reshape(B, H, N)
         idx = self.newest_step_idx
 
+        # Last actor_action_history_steps actions, oldest-to-newest, flattened
+        a_s, a_e = self._actor_act_start, self._actor_act_end
+        actions_recent = action_hist[:, a_s:a_e, :].reshape(B, -1)
+
         return {
             "base_lin_vel":      _s(self._sl_base_lin_vel),
             "base_ang_vel":      _s(self._sl_base_ang_vel),
@@ -470,10 +529,11 @@ class STZMPStudentTeacher(nn.Module):
             "joint_vel_hist":    joint_vel_hist,
             "action_hist":       action_hist,
             "height_scan":       _s(self._sl_height_scan),
-            # Current (most recent) step of each history
+            # Most-recent step of joint histories
             "joint_pos_cur":     joint_pos_hist[:, idx, :],
             "joint_vel_cur":     joint_vel_hist[:, idx, :],
-            "actions_cur":       action_hist[:, idx, :],
+            # Short action window for actor (full window goes to encoder)
+            "actions_recent":    actions_recent,
         }
 
     def _build_leg_tokens(self, parsed: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -496,8 +556,22 @@ class STZMPStudentTeacher(nn.Module):
         return torch.stack(leg_tokens, dim=1)                   # [B, num_legs, token_dim]
 
     def _build_base_token(self, parsed: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Encoder base token: [projected_gravity | base_ang_vel], shape [B, 6]."""
-        return torch.cat([parsed["projected_gravity"], parsed["base_ang_vel"]], dim=-1)
+        """Task-conditioned encoder base token.
+
+        Returns ``[projected_gravity | base_ang_vel | base_lin_vel | command]``,
+        shape ``[B, 14]`` (with default dim config).  Including the command
+        (foot-position target + leg-active flag) makes the cross-attention query
+        task-conditioned so the encoder naturally attends to the manipulator leg.
+        """
+        return torch.cat(
+            [
+                parsed["projected_gravity"],  # orientation context    (3D)
+                parsed["base_ang_vel"],        # rotational dynamics    (3D)
+                parsed["base_lin_vel"],        # translational dynamics (3D)
+                parsed["command"],             # task goal + leg flag   (5D)
+            ],
+            dim=-1,
+        )
 
     def _build_actor_input(
         self,
@@ -508,16 +582,16 @@ class STZMPStudentTeacher(nn.Module):
         """Concatenate all inputs for the student actor MLP."""
         return torch.cat(
             [
-                parsed["joint_pos_cur"],      # current joint positions  (num_joints D)
-                parsed["joint_vel_cur"],      # current joint velocities (num_joints D)
-                parsed["actions_cur"],        # current previous actions  (num_joints D)
-                parsed["base_lin_vel"],       # base linear velocity  (3D)
-                parsed["base_ang_vel"],       # base angular velocity (3D)
-                parsed["projected_gravity"],  # projected gravity     (3D)
-                parsed["command"],            # foot position command (5D)
-                parsed["height_scan"],        # height scan           (KD)
-                z_sample,                     # ZMP latent sample     (2D)
-                logvar_zmp,                   # ZMP log-variance      (2D) — actor gates on this
+                parsed["joint_pos_cur"],      # current joint positions          (N D)
+                parsed["joint_vel_cur"],      # current joint velocities         (N D)
+                parsed["actions_recent"],     # recent actions (K steps × N)     (K*N D)
+                parsed["base_lin_vel"],       # base linear velocity             (3D)
+                parsed["base_ang_vel"],       # base angular velocity            (3D)
+                parsed["projected_gravity"],  # projected gravity                (3D)
+                parsed["command"],            # foot position command            (5D)
+                parsed["height_scan"],        # height scan                      (KD)
+                z_sample,                     # ZMP latent sample                (2D)
+                logvar_zmp,                   # ZMP log-variance (uncertainty gate)(2D)
             ],
             dim=-1,
         )
@@ -777,8 +851,12 @@ def _print_obs_layout(
     num_joints: int,
     height_scan_dim: int,
     history_order: str,
+    actor_action_history_steps: int = 3,
+    base_enc_dim: int = 14,
+    leg_names: list[str] | None = None,
+    leg_joint_indices: list[list[int]] | None = None,
 ) -> None:
-    """Print the policy obs layout table for sanity-checking term order."""
+    """Print the policy obs layout table and architecture summary for sanity-checking."""
     H, N = history_len, num_joints
     items: list[tuple[str, int]] = [
         ("base_lin_vel",                      base_lin_vel_dim),
@@ -802,4 +880,16 @@ def _print_obs_layout(
     status = "✓ OK" if offset == total_dim else f"✗ MISMATCH (got {offset}, expected {total_dim})"
     print("  " + "-" * 60)
     print(f"  Total: {total_dim}D  {status}")
+    print("=" * 65)
+    print("[STZMPStudentTeacher] Encoder base token (query):")
+    print(f"  [projected_gravity | base_ang_vel | base_lin_vel | command] = {base_enc_dim}D")
+    print(f"  → cross-attention is task-conditioned (command contains leg flag)")
+    print("[STZMPStudentTeacher] Actor action history window:")
+    print(f"  Encoder leg tokens : full H={H} steps")
+    print(f"  Actor actions input: last {actor_action_history_steps} steps "
+          f"(actor_action_history_steps={actor_action_history_steps})")
+    if leg_names and leg_joint_indices:
+        print("[STZMPStudentTeacher] Leg → joint index mapping (attn_weights order):")
+        for i, (name, idxs) in enumerate(zip(leg_names, leg_joint_indices)):
+            print(f"  attn_weights[{i}] = {name:<6}  joints {idxs}")
     print("=" * 65)
