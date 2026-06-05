@@ -46,10 +46,13 @@ class RolloutStorage:
         self.actions_shape = actions_shape
 
         # Core
-        self.observations = TensorDict(
-            {key: torch.zeros(num_transitions_per_env, *value.shape, device=device) for key, value in obs.items()},
-            batch_size=[num_transitions_per_env, num_envs],
-            device=self.device,
+        # Allocate the observation buffer by expanding a single observation over the
+        # transition dimension. Using ``expand`` + ``clone`` (instead of building each
+        # leaf manually from ``value.shape``) means nested TensorDicts -- e.g. observation
+        # terms kept unconcatenated so they retain a time dimension for a conv encoder --
+        # are handled exactly like flat observation tensors.
+        self.observations = (
+            obs.unsqueeze(0).expand(num_transitions_per_env, *obs.shape).clone().to(self.device).zero_()
         )
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)

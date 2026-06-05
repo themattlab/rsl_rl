@@ -12,6 +12,8 @@ from .student_teacher import StudentTeacher
 from .student_teacher_recurrent import StudentTeacherRecurrent
 from .stzmp_student_teacher import STZMPEncoder, STZMPStudentTeacher
 from .symmetry import resolve_symmetry_config
+from .conv_actor import ConvActorCritic
+from .conv_encoder import ConvHistoryEncoder
 
 __all__ = [
     "ActorCritic",
@@ -23,4 +25,6 @@ __all__ = [
     "StudentTeacherRecurrent",
     "resolve_rnd_config",
     "resolve_symmetry_config",
+    "ConvActorCritic",
+    "ConvHistoryEncoder",
 ]

@@ -26,7 +26,7 @@ from rsl_rl.modules import (
 from rsl_rl.utils import resolve_obs_groups, store_code_state
 
 
-class OnPolicyRunner:
+class ConvRunner:
     """On-policy runner for training and evaluation of actor-critic methods."""
 
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device: str = "cpu") -> None:
@@ -66,72 +66,62 @@ class OnPolicyRunner:
         self.git_status_repos = [rsl_rl.__file__]
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
-        # Initialize writer
         self._prepare_logging_writer()
 
-        # Randomize initial episode lengths (for exploration)
         if init_at_random_ep_len:
             self.env.episode_length_buf = torch.randint_like(
                 self.env.episode_length_buf, high=int(self.env.max_episode_length)
             )
 
-        # Start learning
         obs = self.env.get_observations().to(self.device)
-        self.train_mode()  # switch to train mode (for dropout for example)
+        self.train_mode()
 
-        # Book keeping
         ep_infos = []
         rewbuffer = deque(maxlen=100)
         lenbuffer = deque(maxlen=100)
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
-        # Create buffers for logging extrinsic and intrinsic rewards
         if self.alg.rnd:
             erewbuffer = deque(maxlen=100)
             irewbuffer = deque(maxlen=100)
             cur_ereward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
             cur_ireward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
-        # Ensure all parameters are in-synced
         if self.is_distributed:
             print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
             self.alg.broadcast_parameters()
 
-        # Start training
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
+
         for it in range(start_iter, tot_iter):
             start = time.time()
-            # Rollout
+
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
-                    # Sample actions
+                    # act() encodes internally and caches in _last_encoded
                     actions = self.alg.act(obs)
-                    # Step the environment
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
-                    # Move to device
-                    obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
-                    # Process the step
+                    obs, rewards, dones = obs.to(self.device), rewards.to(self.device), dones.to(self.device)
+
+                    # reuse cached encoded obs from act() — no second encode needed
+
                     self.alg.process_env_step(obs, rewards, dones, extras)
-                    # Extract intrinsic rewards (only for logging)
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
-                    # Book keeping
+
                     if self.log_dir is not None:
                         if "episode" in extras:
                             ep_infos.append(extras["episode"])
                         elif "log" in extras:
                             ep_infos.append(extras["log"])
-                        # Update rewards
                         if self.alg.rnd:
                             cur_ereward_sum += rewards
                             cur_ireward_sum += intrinsic_rewards
                             cur_reward_sum += rewards + intrinsic_rewards
                         else:
                             cur_reward_sum += rewards
-                        # Update episode length
                         cur_episode_length += 1
-                        # Clear data for completed episodes
                         new_ids = (dones > 0).nonzero(as_tuple=False)
                         rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
@@ -147,10 +137,9 @@ class OnPolicyRunner:
                 collection_time = stop - start
                 start = stop
 
-                # Compute returns
+                # encode final obs for bootstrap value in compute_returns
                 self.alg.compute_returns(obs)
 
-            # Update policy
             loss_dict = self.alg.update()
 
             stop = time.time()
@@ -400,13 +389,9 @@ class OnPolicyRunner:
 
     def _construct_algorithm(self, obs: TensorDict) -> PPO:
         """Construct the actor-critic algorithm."""
-        # Resolve RND config
         self.alg_cfg = resolve_rnd_config(self.alg_cfg, obs, self.cfg["obs_groups"], self.env)
-
-        # Resolve symmetry config
         self.alg_cfg = resolve_symmetry_config(self.alg_cfg, self.env)
 
-        # Resolve deprecated normalization config
         if self.cfg.get("empirical_normalization") is not None:
             warnings.warn(
                 "The `empirical_normalization` parameter is deprecated. Please set `actor_obs_normalization` and "
@@ -418,17 +403,16 @@ class OnPolicyRunner:
             if self.policy_cfg.get("critic_obs_normalization") is None:
                 self.policy_cfg["critic_obs_normalization"] = self.cfg["empirical_normalization"]
 
-        # Initialize the policy
         actor_critic_class = eval(self.policy_cfg.pop("class_name"))
         actor_critic: ActorCritic | ActorCriticRecurrent = actor_critic_class(
             obs, self.cfg["obs_groups"], self.env.num_actions, **self.policy_cfg
         ).to(self.device)
 
-        # Initialize the algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
         alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
 
-        # Initialize the storage
+        # Store the raw (structured) observations. The conv encoder is trainable, so it must
+        # be re-run on the raw obs in every PPO minibatch -- we cannot pre-encode here.
         alg.init_storage(
             "rl",
             self.env.num_envs,

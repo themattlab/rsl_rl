@@ -38,6 +38,13 @@ class ActorCritic(nn.Module):
             )
         super().__init__()
 
+        # print("Observation info")
+        # print(f"Obs: {obs}")
+        # print(f"Obs Groups: {obs_groups}")
+        # print(f"Obs shape: {obs.shape if hasattr(obs, 'shape') else 'No shape attribute'}")
+        # print(f"Obs type: {type(obs)}")
+        # print(f"Obs attributes/methods: {dir(obs)}")
+
         # Get the observation dimensions
         self.obs_groups = obs_groups
         num_actor_obs = 0
