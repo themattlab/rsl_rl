@@ -146,6 +146,9 @@ class ConvRunner:
             learn_time = stop - start
             self.current_learning_iteration = it
 
+            if isinstance(self.alg.policy, ConvActorCritic) and it % 100 == 0:
+                self.alg.policy.check_encoder_changing()
+
             if self.log_dir is not None and not self.disable_logs:
                 # Log information
                 self.log(locals())
@@ -296,6 +299,11 @@ class ConvRunner:
             saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.alg.rnd_optimizer.state_dict()
         torch.save(saved_dict, path)
+
+        if isinstance(self.alg.policy, ConvActorCritic) and not getattr(self, "_encoder_keys_logged", False):
+            encoder_keys = [k for k in saved_dict["model_state_dict"] if k.startswith("encoder")]
+            print(f"[checkpoint] {len(encoder_keys)} encoder keys, e.g. {encoder_keys[:3]}")
+            self._encoder_keys_logged = True
 
         # Upload model to external logging service
         if self.logger_type in ["neptune", "wandb"] and not self.disable_logs:

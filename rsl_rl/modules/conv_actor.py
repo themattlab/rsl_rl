@@ -125,6 +125,27 @@ class ConvActorCritic(nn.Module):
         # Disable args validation for speedup
         Normal.set_default_validate_args(False)
 
+        encoder_params = sum(p.numel() for p in self.encoder.parameters())
+        actor_params = sum(p.numel() for p in self.actor.parameters())
+        critic_params = sum(p.numel() for p in self.critic.parameters())
+        total_params = sum(p.numel() for p in self.parameters())
+        other_params = total_params - encoder_params - actor_params - critic_params
+
+        print(f"Encoder params:  {encoder_params:,}")
+        print(f"Actor params:    {actor_params:,}")
+        print(f"Critic params:   {critic_params:,}")
+        print(f"Other params:    {other_params:,}")
+        print(f"Total params:    {total_params:,}")
+
+        registered_encoder = sum(
+            p.numel() for name, p in self.named_parameters() if name.startswith("encoder.")
+        )
+        assert registered_encoder == encoder_params and encoder_params > 0, (
+            "Encoder is NOT registered as part of the model!"
+        )
+
+        self._encode_call_count = 0
+
     def _build_mlp(
         self,
         input_dim: int,
@@ -145,6 +166,10 @@ class ConvActorCritic(nn.Module):
         """Encode history through conv + concat normalised flat terms."""
         history = {k: obs["policy"][k] for k in self.history_keys}
         conv_out = self.encoder(history)                     # [N, enc_out_dim]
+
+        self._encode_call_count += 1
+        if self._encode_call_count <= 3:
+            print(f"_encode #{self._encode_call_count}, conv_out shape: {tuple(conv_out.shape)}")
 
         if self.flat_keys:
             flat = torch.cat(
@@ -252,6 +277,19 @@ class ConvActorCritic(nn.Module):
             self.actor_obs_normalizer.update(self._flat_terms(obs))
         if self.critic_obs_normalization:
             self.critic_obs_normalizer.update(self._flat_terms(obs))
+
+    def check_encoder_changing(self) -> None:
+        """Compare encoder weights against a snapshot taken on first call."""
+        if not hasattr(self, "_enc_weight_snapshot"):
+            self._enc_weight_snapshot = {
+                name: param.data.clone() for name, param in self.encoder.named_parameters()
+            }
+            print("[encoder] snapshot taken.")
+            return
+
+        for name, param in self.encoder.named_parameters():
+            diff = (param.data - self._enc_weight_snapshot[name]).abs().max().item()
+            print(f"[encoder] {name:40s} max_change={diff:.6f}")
 
     def load_state_dict(self, state_dict: dict, strict: bool = True) -> bool:
         """Load the parameters of the actor-critic model.
