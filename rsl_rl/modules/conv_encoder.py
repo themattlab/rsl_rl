@@ -35,26 +35,34 @@ class ConvHistoryEncoder(nn.Module):
         self.T = T
         self.history_keys = history_keys
 
+        print("\n\n\nUsing ConvHistoryEncoder with causal convolution and temporal pooling\n\n\n")
+
         in_channels = sum(obs["policy"][k].shape[-1] for k in history_keys)
 
         self.conv = nn.Sequential(
-            CausalConv1d(in_channels, 64,  kernel_size=5),
+            CausalConv1d(in_channels, 64,  kernel_size=3),
             nn.ReLU(),
-            CausalConv1d(64,          128, kernel_size=5),
+            CausalConv1d(64,          128, kernel_size=3),
             nn.ReLU(),
         )
-        self.proj = nn.Linear(128, out_dim)
+        self.proj = nn.Sequential(
+            nn.Linear(128, out_dim),
+            nn.LayerNorm(out_dim),    # stabilizes encoder output across rollouts
+        )
 
     def forward(self, history: dict) -> torch.Tensor:
         # history values: [N, T, feat_dim]
         x = torch.cat(
             [history[k] for k in self.history_keys], dim=-1
         )                        # [N, T, D]
+        current = x[:, -1, :]
         x = x.permute(0, 2, 1)  # [N, D, T]
 
-        x = self.conv(x)         # [N, 128, T]  — same length, causal
-        x = x[:, :, -1]          # [N, 128]  — truly the most-recent timestep
-        return self.proj(x)      # [N, out_dim]
+        x = self.conv(x)         # [N, 64, T]  — same length, causal
+        x = x.mean(dim=-1) 
+        temporal = self.proj(x) 
+
+        return torch.cat([temporal, current], dim=-1) # [N, out_dim + D]
 
 
 # class ConvHistoryEncoder(nn.Module):

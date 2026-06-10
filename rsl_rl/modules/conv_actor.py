@@ -64,7 +64,9 @@ class ConvActorCritic(nn.Module):
         self.encoder = ConvHistoryEncoder( history_keys=self.history_keys, obs=obs, T=history_len, out_dim=enc_out_dim)
 
         flat_dim = sum(obs["policy"][key].shape[-1] for key in self.flat_keys)
-        mlp_input_dim = enc_out_dim + flat_dim
+        history_feat_dim = sum(obs["policy"][k].shape[-1] for k in self.history_keys)
+
+        mlp_input_dim = enc_out_dim + flat_dim + history_feat_dim
 
         # Get the observation dimensions
         self.obs_groups = obs_groups
